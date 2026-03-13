@@ -749,6 +749,40 @@ class Renderer {
     this.W = canvas.width; this.H = canvas.height;
     this._stars = [];
     for (let i = 0; i < 80; i++) this._stars.push({ x: Math.random()*800, y: Math.random()*200, r: Math.random()*1.5+0.3 });
+    this._sprites = {};
+    this._spritesReady = false;
+    this._initSprites();
+  }
+  _initSprites() {
+    if (typeof SPRITE_DATA === 'undefined') return;
+    let loaded = 0;
+    const keys = Object.keys(SPRITE_DATA);
+    const total = keys.length;
+    for (const key of keys) {
+      const img = new Image();
+      img.onload = () => { loaded++; if (loaded === total) this._spritesReady = true; };
+      img.src = SPRITE_DATA[key];
+      this._sprites[key] = img;
+    }
+  }
+  // Returns true if sprite was drawn, false if unavailable (fallback to procedural)
+  _drawSprite(key, x, y, w, h, flipX=false, alpha=1) {
+    const img = this._sprites[key];
+    if (!img || !img.complete || !img.naturalHeight) return false;
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    if (flipX) {
+      ctx.translate(x + w, y);
+      ctx.scale(-1, 1);
+      ctx.drawImage(img, 0, 0, w, h);
+    } else {
+      ctx.drawImage(img, x, y, w, h);
+    }
+    ctx.restore();
+    return true;
   }
   render(state) {
     const { player, enemies, projectiles, platforms, effects, hud, stageNum, enemiesDefeated, totalEnemies, bgVariant } = state;
@@ -845,9 +879,13 @@ class Renderer {
     }
   }
   _drawPlayer(player) {
-    const ctx = this.ctx; ctx.save();
-    if (player.isInvincible) ctx.globalAlpha = 0.5 + Math.sin(Date.now()/80)*0.5;
     const { x, y, w, h, facing: f, charId } = player;
+    const alpha = player.isInvincible ? 0.5 + Math.sin(Date.now()/80)*0.5 : 1;
+    const flipX = (f === -1);
+    if (this._drawSprite(charId, x, y, w, h, flipX, alpha)) return;
+    // Procedural fallback
+    const ctx = this.ctx; ctx.save();
+    ctx.globalAlpha = alpha;
     if (charId==='champion') this._drawChampion(ctx,x,y,w,h,f,player);
     else if (charId==='ranger') this._drawRanger(ctx,x,y,w,h,f,player);
     else if (charId==='savage') this._drawSavage(ctx,x,y,w,h,f,player);
@@ -990,19 +1028,27 @@ class Renderer {
     ctx.restore();
   }
   _drawEnemy(enemy) {
-    const ctx = this.ctx; ctx.save();
-    if (enemy.hitFlashTimer > 0) ctx.globalAlpha = 0.4 + Math.sin(Date.now()/40)*0.6;
-    const { x, y, w, h, facing:f, faction, variant, isBoss } = enemy;
-    if (isBoss)               this._drawBoss(ctx, enemy);
-    else if (faction==='bandits') this._drawBandit(ctx,x,y,w,h,f,variant);
-    else if (faction==='goblins') this._drawGoblin(ctx,x,y,w,h,f,variant);
-    else if (faction==='orcs')    this._drawOrc(ctx,x,y,w,h,f,variant);
-    // HP bar
+    const { x, y, w, h, facing:f, faction, variant, isBoss, enemyId } = enemy;
+    const alpha = enemy.hitFlashTimer > 0 ? 0.4 + Math.sin(Date.now()/40)*0.6 : 1;
+    const flipX = (f === -1);
+    // Sprite-based drawing (uses enemyId which matches SPRITE_DATA keys)
+    const spriteKey = enemyId || (isBoss ? FACTION_BOSS[faction] : null);
+    if (!spriteKey || !this._drawSprite(spriteKey, x, y, w, h, flipX, alpha)) {
+      // Procedural fallback
+      const ctx = this.ctx; ctx.save();
+      ctx.globalAlpha = alpha;
+      if (isBoss)                  this._drawBoss(ctx, enemy);
+      else if (faction==='bandits') this._drawBandit(ctx,x,y,w,h,f,variant);
+      else if (faction==='goblins') this._drawGoblin(ctx,x,y,w,h,f,variant);
+      else if (faction==='orcs')    this._drawOrc(ctx,x,y,w,h,f,variant);
+      ctx.restore();
+    }
+    // HP bar (always drawn on top)
+    const ctx = this.ctx;
     const bw=enemy.w+8, bx=enemy.x-4, by=enemy.y-10, fr=Math.max(0,enemy.hp/enemy.maxHp);
     ctx.fillStyle='#222'; ctx.fillRect(bx,by,bw,5);
     ctx.fillStyle=fr>0.5?Colors.HP_HIGH:fr>0.25?Colors.HP_MED:Colors.HP_LOW; ctx.fillRect(bx,by,Math.round(bw*fr),5);
     ctx.strokeStyle='#555'; ctx.lineWidth=1; ctx.strokeRect(bx,by,bw,5);
-    ctx.restore();
   }
   _drawBandit(ctx,x,y,w,h,f,variant) {
     ctx.save();
@@ -1350,12 +1396,20 @@ class Renderer {
       const cx=startX+i*(cardW+gap), cy=100, sel=i===selectedIndex;
       ctx.fillStyle=sel?'rgba(255,200,50,0.2)':'rgba(0,0,0,0.5)'; ctx.fillRect(cx,cy,cardW,cardH);
       ctx.strokeStyle=sel?Colors.COOLDOWN_READY:'rgba(255,255,255,0.3)'; ctx.lineWidth=sel?3:1; ctx.strokeRect(cx,cy,cardW,cardH);
-      ctx.save(); ctx.translate(cx+cardW/2,cy+80); ctx.scale(2,2);
-      const pw=def.width, ph=def.height, px=-pw/2, py=-ph/2;
-      if (def.id==='champion') this._drawChampion(ctx,px,py,pw,ph,1,{state:'idle'});
-      else if (def.id==='ranger') this._drawRanger(ctx,px,py,pw,ph,1,{state:'idle'});
-      else if (def.id==='savage') this._drawSavage(ctx,px,py,pw,ph,1,{state:'idle'});
-      ctx.restore();
+      const sprImg = this._sprites[def.id];
+      if (sprImg && sprImg.complete && sprImg.naturalHeight > 0) {
+        const dispH = 110;
+        const dispW = Math.round(sprImg.naturalWidth / sprImg.naturalHeight * dispH);
+        ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(sprImg, cx + cardW/2 - dispW/2, cy + 18, dispW, dispH);
+      } else {
+        ctx.save(); ctx.translate(cx+cardW/2,cy+80); ctx.scale(2,2);
+        const pw=def.width, ph=def.height, px=-pw/2, py=-ph/2;
+        if (def.id==='champion') this._drawChampion(ctx,px,py,pw,ph,1,{state:'idle'});
+        else if (def.id==='ranger') this._drawRanger(ctx,px,py,pw,ph,1,{state:'idle'});
+        else if (def.id==='savage') this._drawSavage(ctx,px,py,pw,ph,1,{state:'idle'});
+        ctx.restore();
+      }
       ctx.fillStyle=sel?Colors.COOLDOWN_READY:Colors.HUD_TEXT; ctx.font=`bold ${sel?18:16}px monospace`; ctx.textAlign='center';
       ctx.fillText(def.name,cx+cardW/2,cy+155);
       ctx.fillStyle='rgba(255,255,255,0.7)'; ctx.font='10px monospace'; ctx.fillText(def.description,cx+cardW/2,cy+172);
