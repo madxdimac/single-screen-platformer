@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Running the Game
 
-Open `index.html` directly in a browser — no build step required. ES modules are not used; all code is bundled in `js/bundle.js`.
+Open `index.html` directly in a browser — no build step, no server required. The file is fully self-contained: CSS and all game JS are inlined into a single HTML file (~64KB).
 
 If a local server is preferred: `python -m http.server 8080` then visit `http://localhost:8080`.
 
 ## Architecture
 
-All game logic lives in **`js/bundle.js`** — a single concatenated file containing every class in dependency order. The individual source files under `js/` (entities, systems, data) are the canonical sources but are **not loaded by the browser**; they exist for readability. When editing game logic, **edit `js/bundle.js` directly** or edit the source files and manually re-concatenate into bundle.js.
+All game logic is inlined inside the `<script>` tag in **`index.html`**, which also contains the CSS. The identical code lives in **`js/bundle.js`** for readability. The individual source files under `js/` (entities, systems, data) are the modular originals but are **not loaded by the browser**. When editing game logic, **edit the `<script>` block in `index.html`** and keep `js/bundle.js` in sync.
 
 ### Class dependency order in bundle.js
 
