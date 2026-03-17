@@ -487,6 +487,7 @@ class InputManager {
   get confirm(){ return this.isPressed('Enter'); }
   get arrowLeftPress()  { return this.isPressed('ArrowLeft')  || this.isPressed('KeyA'); }
   get arrowRightPress() { return this.isPressed('ArrowRight') || this.isPressed('KeyD'); }
+  get tab()  { return this.isPressed('Tab'); }
 }
 
 // ─── PhysicsEngine ────────────────────────────────────────────────────────────
@@ -1433,7 +1434,7 @@ class Renderer {
     }
     ctx.restore();
   }
-  renderCharacterSelect(selectedIndex) {
+  renderCharacterSelect(selectedIndex, selectedResolution=0) {
     const ctx = this.ctx;
     const g = ctx.createLinearGradient(0,0,0,this.H); g.addColorStop(0,'#0d1b2a'); g.addColorStop(1,'#1e3a5f');
     ctx.fillStyle=g; ctx.fillRect(0,0,this.W,this.H);
@@ -1442,9 +1443,33 @@ class Renderer {
     ctx.globalAlpha=1;
     ctx.fillStyle=Colors.COOLDOWN_READY; ctx.font='bold 32px monospace'; ctx.textAlign='center'; ctx.fillText('MEDIEVAL FANTASY',400,55);
     ctx.fillStyle=Colors.HUD_TEXT; ctx.font='16px monospace'; ctx.fillText('Choose your champion',400,80);
+    // Resolution selector
+    const resOptions = ['\u25a0 800\u00d7500', '\u25a0 1280\u00d7800', '\u25a0 FULLSCREEN'];
+    const resLabels  = ['Standard', 'Large', 'Fullscreen'];
+    const btnW=130, btnH=28, btnGap=12;
+    const totalW = resOptions.length*btnW + (resOptions.length-1)*btnGap;
+    const bx0 = (this.W - totalW) / 2;
+    const by  = 392;
+    ctx.font='11px monospace'; ctx.textAlign='center';
+    ctx.fillStyle='rgba(255,255,255,0.5)'; ctx.fillText('RESOLUTION  \u2014  Tab to change',400,by-10);
+    resOptions.forEach((label, i) => {
+      const bx = bx0 + i*(btnW+btnGap);
+      const sel = i===selectedResolution;
+      ctx.fillStyle = sel ? 'rgba(255,200,50,0.25)' : 'rgba(0,0,0,0.5)';
+      ctx.fillRect(bx, by, btnW, btnH);
+      ctx.strokeStyle = sel ? Colors.COOLDOWN_READY : 'rgba(255,255,255,0.3)';
+      ctx.lineWidth = sel ? 2 : 1;
+      ctx.strokeRect(bx, by, btnW, btnH);
+      ctx.fillStyle = sel ? Colors.COOLDOWN_READY : 'rgba(255,255,255,0.7)';
+      ctx.font = `${sel?'bold ':''}11px monospace`;
+      ctx.fillText(resLabels[i], bx + btnW/2, by + 12);
+      ctx.fillStyle = sel ? 'rgba(255,200,50,0.8)' : 'rgba(255,255,255,0.4)';
+      ctx.font='10px monospace';
+      ctx.fillText(resOptions[i].slice(2), bx + btnW/2, by + 23);
+    });
     ctx.fillStyle='rgba(255,255,255,0.6)'; ctx.font='12px monospace';
-    ctx.fillText('\u2190 \u2192 to select   Enter to confirm',400,460);
-    ctx.fillText('Z/J: Attack   X/K: Special   WASD/Arrows: Move   Space/W/Up: Jump',400,478);
+    ctx.fillText('\u2190 \u2192 to select   Tab: resolution   Enter to confirm',400,446);
+    ctx.fillText('Z/J: Attack   X/K: Special   WASD/Arrows: Move   Space/W/Up: Jump',400,462);
     const defs = Object.values(CharacterDefs);
     const cardW=200, cardH=280, gap=30;
     const startX = (this.W - (defs.length*cardW + (defs.length-1)*gap)) / 2;
@@ -1573,6 +1598,7 @@ class Game {
     this.aiSystem     = new AISystem();
     this.hud = new HUDSystem(this.renderer.ctx);
     this.state = 'CHARACTER_SELECT'; this.selectedCharIndex = 0;
+    this.selectedResolution = 0; // 0=800×500, 1=1280×800, 2=Fullscreen
     this.player = null; this.enemies = []; this.projectiles = []; this.platforms = [];
     this.stageIndex = 0; this._lastTime = 0;
   }
@@ -1586,6 +1612,40 @@ class Game {
       this._render();
     };
     requestAnimationFrame(loop);
+    window.addEventListener('resize', () => {
+      if (this.selectedResolution === 2) this._scaleToWindow();
+    });
+    document.addEventListener('fullscreenchange', () => {
+      if (!document.fullscreenElement && this.selectedResolution === 2) {
+        // User pressed Escape to exit fullscreen — revert to standard
+        this.selectedResolution = 0;
+        this.canvas.style.width = '800px';
+        this.canvas.style.height = '500px';
+      }
+    });
+  }
+  _applyResolution(idx) {
+    const canvas = this.canvas;
+    const container = canvas.parentElement;
+    if (idx === 0) {
+      canvas.style.width = '800px'; canvas.style.height = '500px';
+      if (document.fullscreenElement) document.exitFullscreen();
+    } else if (idx === 1) {
+      canvas.style.width = '1280px'; canvas.style.height = '800px';
+      if (document.fullscreenElement) document.exitFullscreen();
+    } else {
+      const req = container.requestFullscreen || container.webkitRequestFullscreen;
+      if (req) {
+        req.call(container).then(() => this._scaleToWindow()).catch(() => this._scaleToWindow());
+      } else {
+        this._scaleToWindow();
+      }
+    }
+  }
+  _scaleToWindow() {
+    const scale = Math.min(window.innerWidth / 800, window.innerHeight / 500);
+    this.canvas.style.width  = Math.floor(800 * scale) + 'px';
+    this.canvas.style.height = Math.floor(500 * scale) + 'px';
   }
   _update(dt) {
     if      (this.state==='CHARACTER_SELECT') this._updateCharSelect();
@@ -1596,7 +1656,11 @@ class Game {
   _updateCharSelect() {
     if (this.input.arrowLeftPress)  this.selectedCharIndex = (this.selectedCharIndex-1+CHAR_LIST.length)%CHAR_LIST.length;
     if (this.input.arrowRightPress) this.selectedCharIndex = (this.selectedCharIndex+1)%CHAR_LIST.length;
-    if (this.input.confirm) { this.stageIndex=0; this._initStage(CHAR_LIST[this.selectedCharIndex]); this.state='PLAYING'; }
+    if (this.input.tab) this.selectedResolution = (this.selectedResolution + 1) % 3;
+    if (this.input.confirm) {
+      this._applyResolution(this.selectedResolution);
+      this.stageIndex=0; this._initStage(CHAR_LIST[this.selectedCharIndex]); this.state='PLAYING';
+    }
   }
   _initStage(charId) {
     const { platforms, playerStart } = this.stageManager.loadStage(this.stageIndex);
@@ -1651,7 +1715,7 @@ class Game {
     const ctx = this.renderer.ctx;
     ctx.clearRect(0, 0, 800, 500);
     if (this.state==='CHARACTER_SELECT') {
-      this.renderer.renderCharacterSelect(this.selectedCharIndex);
+      this.renderer.renderCharacterSelect(this.selectedCharIndex, this.selectedResolution);
     } else if (this.state==='PLAYING' || this.state==='STAGE_CLEAR') {
       this.renderer.render({
         player:this.player, enemies:this.enemies, projectiles:this.projectiles,
