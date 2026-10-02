@@ -598,10 +598,11 @@ class AttackSystem {
           ? { left:enemy.right,       right:enemy.right+range, top:enemy.top, bottom:enemy.bottom }
           : { left:enemy.left-range,  right:enemy.left,        top:enemy.top, bottom:enemy.bottom };
         this.registerMeleeHitbox(rect, enemy.damage, 'enemy', 300);
+        this.effects.push({ type:'slash', x:rect.left, y:rect.top, w:range, h:rect.bottom-rect.top, timer:150, maxTimer:150, facing:dir, enemy:true });
       } else if (pa.type === 'projectile' && player) {
         const dx = player.cx - enemy.cx, dy = player.cy - enemy.cy;
         const dist = Math.hypot(dx, dy) || 1, speed = enemy.projectileSpeed;
-        this.spawnProjectile(enemy.cx, enemy.cy, (dx/dist)*speed, (dy/dist)*speed, enemy.damage, 'enemy', false, projectiles);
+        this.spawnProjectile(enemy.cx, enemy.cy, (dx/dist)*speed, (dy/dist)*speed, enemy.damage, 'enemy', false, projectiles).kind = enemy.enemyId;
       }
     }
   }
@@ -745,14 +746,30 @@ class HUDSystem {
 
 // ─── Renderer ─────────────────────────────────────────────────────────────────
 class Renderer {
+  static VISUAL_SCALE = 1.45; // sprite height relative to hitbox height
+  static OUTLINE_PX = 3;      // outline thickness in source-sprite pixels
   constructor(canvas) {
     this.canvas = canvas; this.ctx = canvas.getContext('2d');
-    this.W = canvas.width; this.H = canvas.height;
+    this.W = 800; this.H = 500; // logical size; the backing store may be larger (see setDisplaySize)
     this._stars = [];
     for (let i = 0; i < 80; i++) this._stars.push({ x: Math.random()*800, y: Math.random()*200, r: Math.random()*1.5+0.3 });
-    this._sprites = {};
+    this._sprites = {};  // key -> outlined sprite canvas
+    this._flash = {};    // key -> white silhouette canvas (hit flash)
     this._spritesReady = false;
+    this._anim = new WeakMap(); // entity -> per-entity animation state
+    this._now = performance.now(); this._dt = 0;
+    this._platforms = [];
     this._initSprites();
+    this.setDisplaySize(800, 500);
+  }
+  // Size the backing store to the on-screen size so art stays sharp when scaled up;
+  // game code keeps drawing in 800×500 logical coordinates.
+  setDisplaySize(cssW, cssH) {
+    const dpr = window.devicePixelRatio || 1;
+    this.canvas.style.width = cssW + 'px'; this.canvas.style.height = cssH + 'px';
+    this.canvas.width = Math.round(cssW * dpr); this.canvas.height = Math.round(cssH * dpr);
+    this.ctx.setTransform(this.canvas.width / this.W, 0, 0, this.canvas.height / this.H, 0, 0);
+    this._invalidateCaches();
   }
   _initSprites() {
     if (typeof SPRITE_DATA === 'undefined') return;
@@ -761,129 +778,450 @@ class Renderer {
     const total = keys.length;
     for (const key of keys) {
       const img = new Image();
-      img.onload = () => { loaded++; if (loaded === total) this._spritesReady = true; };
+      img.onload = () => {
+        this._sprites[key] = this._makeOutlined(img, Renderer.OUTLINE_PX, '#140a1c');
+        this._flash[key] = this._makeSilhouette(this._sprites[key], '#ffffff');
+        loaded++; if (loaded === total) this._spritesReady = true;
+      };
       img.src = SPRITE_DATA[key];
-      this._sprites[key] = img;
     }
   }
-  // Returns true if sprite was drawn, false if unavailable (fallback to procedural)
-  _drawSprite(key, x, y, w, h, flipX=false, alpha=1) {
-    const img = this._sprites[key];
-    if (!img || !img.complete || !img.naturalHeight) return false;
-    const ctx = this.ctx;
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-    if (flipX) {
-      ctx.translate(x + w, y);
-      ctx.scale(-1, 1);
-      ctx.drawImage(img, 0, 0, w, h);
+  _makeSilhouette(src, color) {
+    const c = document.createElement('canvas'); c.width = src.width; c.height = src.height;
+    const g = c.getContext('2d');
+    g.drawImage(src, 0, 0);
+    g.globalCompositeOperation = 'source-in'; g.fillStyle = color; g.fillRect(0, 0, c.width, c.height);
+    return c;
+  }
+  // Sprite with a dark outline: silhouette stamped in 8 directions, sprite on top.
+  _makeOutlined(img, p, color) {
+    const sil = this._makeSilhouette(img, color);
+    const c = document.createElement('canvas'); c.width = img.width + p*2; c.height = img.height + p*2;
+    const g = c.getContext('2d');
+    for (let a = 0; a < 8; a++) {
+      g.drawImage(sil, p + Math.round(Math.cos(a*Math.PI/4)*p), p + Math.round(Math.sin(a*Math.PI/4)*p));
+    }
+    g.drawImage(img, p, p);
+    return c;
+  }
+  _animState(e) {
+    let s = this._anim.get(e);
+    if (!s) { s = { t: Math.random()*10, runPhase: 0, wasGround: e.onGround, land: 0 }; this._anim.set(e, s); }
+    return s;
+  }
+  // Top of the nearest platform under (x, y), for ground shadows.
+  _groundBelow(x, y) {
+    let best = null;
+    for (const p of this._platforms) {
+      if (!p.active || x < p.x || x > p.x + p.w || p.y < y - 2) continue;
+      if (best === null || p.y < best) best = p.y;
+    }
+    return best;
+  }
+  // Draws an entity's sprite at its natural aspect, feet on the hitbox bottom, with a
+  // ground shadow, procedural squash/stretch animation, hit flash and optional glow.
+  // Returns false if the sprite isn't available (caller falls back to procedural art).
+  _drawActor(e, key, o) {
+    const spr = this._sprites[key];
+    if (!spr) return false;
+    const ctx = this.ctx, s = this._animState(e), dt = this._dt;
+    s.t += dt;
+    // landing squash
+    if (e.onGround && !s.wasGround && s.t > 0.2) s.land = 1;
+    s.wasGround = e.onGround;
+    s.land = Math.max(0, s.land - dt * 6);
+
+    const visH = e.h * Renderer.VISUAL_SCALE * (o.scale || 1);
+    const visW = visH * spr.width / spr.height;
+    const footX = e.x + e.w / 2, footY = e.y + e.h + 1;
+    const f = e.facing === -1 ? -1 : 1;
+
+    let sx = 1, sy = 1, rot = 0, offX = 0, offY = 0;
+    const moving = e.onGround && Math.abs(e.vx) > 5;
+    if (!e.onGround) {
+      if (e.vy < 0) { sy = 1.07; sx = 0.94; } else { sy = 1.03; sx = 0.97; }
+    } else if (moving) {
+      s.runPhase += Math.abs(e.vx) * dt * 0.06;
+      offY = -Math.abs(Math.sin(s.runPhase)) * 2.5;
+      rot = 0.06 * f;
+      sy = 1 + Math.sin(s.runPhase * 2) * 0.02;
     } else {
-      ctx.drawImage(img, x, y, w, h);
+      const br = Math.sin(s.t * 2.6) * 0.018; // idle breathing
+      sy = 1 + br; sx = 1 - br * 0.6;
+    }
+    if (s.land > 0) { sy *= 1 - 0.14 * s.land; sx *= 1 + 0.12 * s.land; }
+    const atk = o.attack || 0; // 0..1 attack progress
+    if (atk > 0) {
+      const k = Math.sin(atk * Math.PI);
+      offX += k * 6 * f; rot += k * 0.14 * f;
+    }
+    if (o.dash) { rot += 0.18 * f; sx *= 1.08; sy *= 0.95; }
+
+    // ground shadow on the surface below
+    const gy = e.onGround ? footY - 1 : this._groundBelow(footX, e.y + e.h);
+    if (gy !== null) {
+      const fade = Math.max(0, 1 - (gy - (e.y + e.h)) / 160);
+      ctx.save();
+      ctx.globalAlpha = 0.35 * fade * (o.alpha ?? 1);
+      ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.ellipse(footX, gy, visW * 0.42 * (0.6 + 0.4*fade), 3.5 * (0.6 + 0.4*fade), 0, 0, Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.globalAlpha = o.alpha ?? 1;
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    ctx.translate(footX + offX, footY + offY);
+    ctx.rotate(rot);
+    ctx.scale(sx * f, sy);
+    if (o.glow) { ctx.shadowColor = o.glow; ctx.shadowBlur = o.glowBlur || 14; }
+    ctx.drawImage(spr, -visW / 2, -visH, visW, visH);
+    ctx.shadowBlur = 0;
+    if (o.flash > 0) {
+      ctx.globalAlpha = (o.alpha ?? 1) * Math.min(1, o.flash) * 0.65;
+      ctx.drawImage(this._flash[key], -visW / 2, -visH, visW, visH);
     }
     ctx.restore();
+    e._visTop = footY - visH * sy; // for HP bar placement
     return true;
   }
   render(state) {
     const { player, enemies, projectiles, platforms, effects, hud, stageNum, enemiesDefeated, totalEnemies, bgVariant } = state;
+    const now = performance.now();
+    this._dt = Math.min(0.05, (now - this._now) / 1000); this._now = now;
+    this._platforms = platforms || [];
     this._drawBg(bgVariant || 0);
+    // light screen shake when the player is hit or a boss starts charging
+    if (player && player.invincibleTimer > 1440 && !player.dead) this._shake = Math.max(this._shake || 0, 4);
+    if (enemies) for (const e of enemies) if (e.charging && e.chargeTimer > e.chargeDuration - 60) this._shake = Math.max(this._shake || 0, 3);
+    this._shake = Math.max(0, (this._shake || 0) - this._dt * 25);
+    const ctx = this.ctx; ctx.save();
+    if (this._shake > 0) ctx.translate((Math.random() - 0.5) * this._shake, (Math.random() - 0.5) * this._shake);
     this._drawPlatforms(platforms || []);
     if (enemies) for (const e of enemies) { if (e.active) this._drawEnemy(e); }
     if (player && !player.dead) this._drawPlayer(player);
     if (projectiles) for (const p of projectiles) { if (p.active) this._drawProjectile(p); }
     if (effects) for (const ef of effects) this._drawEffect(ef);
+    ctx.restore();
+    this._drawVignette();
     if (hud && player) hud.render(player, stageNum, enemiesDefeated, totalEnemies);
   }
-  _drawBg(v) {
-    const ctx = this.ctx;
-    const g = ctx.createLinearGradient(0, 0, 0, this.H);
-    if (v===0) {
-      g.addColorStop(0,'#1a0a2e'); g.addColorStop(0.5,'#3a1a4a'); g.addColorStop(1,'#7a4a1a');
-    } else if (v===1) {
-      g.addColorStop(0,'#041a04'); g.addColorStop(0.5,'#0a2a0a'); g.addColorStop(1,'#142a08');
-    } else {
-      g.addColorStop(0,'#1a0404'); g.addColorStop(0.5,'#2e0a04'); g.addColorStop(1,'#1a0808');
-    }
-    ctx.fillStyle = g; ctx.fillRect(0, 0, this.W, this.H);
-    // twinkling stars
-    ctx.fillStyle = '#ffffff';
-    for (const s of this._stars) {
-      ctx.globalAlpha = 0.6 + Math.sin(Date.now()/1000+s.x)*0.4;
-      ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI*2); ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-    // back hill layer (darker, higher)
-    const backColor = v===1 ? '#0a1e0a' : v===2 ? '#1e0808' : '#1a0e32';
-    ctx.fillStyle = backColor;
-    ctx.beginPath();
-    ctx.moveTo(0, this.H);
-    ctx.lineTo(0, 310);
-    ctx.bezierCurveTo(80, 270, 160, 230, 250, 220);
-    ctx.bezierCurveTo(340, 210, 380, 240, 450, 215);
-    ctx.bezierCurveTo(520, 190, 600, 210, 700, 240);
-    ctx.bezierCurveTo(760, 255, 790, 250, 800, 245);
-    ctx.lineTo(800, this.H);
-    ctx.closePath(); ctx.fill();
-    // front hill layer (lighter, lower)
-    const frontColor = v===1 ? '#122a10' : v===2 ? '#2a1010' : '#221040';
-    ctx.fillStyle = frontColor;
-    ctx.beginPath();
-    ctx.moveTo(0, this.H);
-    ctx.lineTo(0, 370);
-    ctx.bezierCurveTo(60, 345, 140, 325, 220, 340);
-    ctx.bezierCurveTo(300, 355, 360, 330, 440, 335);
-    ctx.bezierCurveTo(520, 340, 600, 320, 680, 345);
-    ctx.bezierCurveTo(740, 360, 780, 355, 800, 350);
-    ctx.lineTo(800, this.H);
-    ctx.closePath(); ctx.fill();
+  // ── World art ───────────────────────────────────────────────────────────────
+  // Static layers (sky, silhouettes, platforms, vignette) are painted once into
+  // offscreen canvases at backing-store resolution; only lights/particles animate.
+  static _rng(seed) {
+    return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
   }
-  _drawPlatforms(platforms) {
-    const ctx = this.ctx;
-    for (const p of platforms) {
-      if (!p.active) continue;
-      if (p.oneWay) {
-        // warm brown stone body
-        ctx.fillStyle = '#6a5030'; ctx.fillRect(p.x, p.y, p.w, p.h);
-        // lighter top face
-        ctx.fillStyle = '#7a6040'; ctx.fillRect(p.x, p.y, p.w, 4);
-        // grass base strip
-        ctx.fillStyle = '#4a8a20'; ctx.fillRect(p.x, p.y, p.w, 3);
-        // grass highlight
-        ctx.fillStyle = '#5aaa28'; ctx.fillRect(p.x, p.y, p.w, 1);
-        // crack lines every 30px
-        ctx.strokeStyle = '#4a3820'; ctx.lineWidth = 1;
-        for (let cx = p.x + 20; cx < p.x + p.w - 10; cx += 30) {
-          ctx.beginPath(); ctx.moveTo(cx, p.y+3); ctx.lineTo(cx+2, p.y+p.h-2); ctx.stroke();
+  _offscreen(draw) {
+    const c = document.createElement('canvas'); c.width = this.canvas.width; c.height = this.canvas.height;
+    const g = c.getContext('2d'); g.scale(c.width / this.W, c.height / this.H); draw(g); return c;
+  }
+  _invalidateCaches() { this._bgCache = null; this._platCache = null; this._vignette = null; }
+  // Jagged/rolling silhouette from x=0..800 at baseY, filled to the bottom.
+  _ridge(g, rnd, baseY, amp, step, color, smooth = true) {
+    g.fillStyle = color; g.beginPath(); g.moveTo(0, this.H);
+    let px = 0, py = baseY - rnd() * amp; g.lineTo(0, py);
+    for (let x = step; x <= this.W + step; x += step) {
+      const y = baseY - rnd() * amp;
+      if (smooth) g.quadraticCurveTo(px + step / 2, Math.min(py, y) - amp * 0.25, x, y); else g.lineTo(x, y);
+      px = x; py = y;
+    }
+    g.lineTo(this.W, this.H); g.closePath(); g.fill();
+  }
+  _glow(g, x, y, r, color) {
+    const gr = g.createRadialGradient(x, y, 0, x, y, r);
+    gr.addColorStop(0, color); gr.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = gr; g.fillRect(x - r, y - r, r * 2, r * 2);
+  }
+  _buildBackdrop(v) {
+    return this._offscreen(g => {
+      const rnd = Renderer._rng(1000 + v), W = this.W, H = this.H;
+      const sky = g.createLinearGradient(0, 0, 0, H);
+      if (v === 0) {        // Bandit camp at dusk
+        sky.addColorStop(0, '#1b0f33'); sky.addColorStop(0.45, '#4a2050'); sky.addColorStop(0.72, '#a8503c'); sky.addColorStop(1, '#f0a050');
+        g.fillStyle = sky; g.fillRect(0, 0, W, H);
+        this._glow(g, 560, 330, 230, 'rgba(255,190,110,0.45)');
+        g.fillStyle = '#ffd88a'; g.beginPath(); g.arc(560, 330, 44, 0, Math.PI * 2); g.fill();
+        this._ridge(g, rnd, 330, 70, 90, '#6a3058');
+        this._ridge(g, rnd, 380, 40, 70, '#43203f');
+        // tents and a palisade on the horizon
+        g.fillStyle = '#26112b';
+        for (const [tx, tw, th] of [[70, 80, 52], [215, 64, 42], [655, 90, 58]]) {
+          g.beginPath(); g.moveTo(tx, 432); g.lineTo(tx + tw / 2, 432 - th); g.lineTo(tx + tw, 432); g.closePath(); g.fill();
+          g.fillRect(tx + tw / 2 - 1, 432 - th - 8, 2, 10);
         }
-        // outline
-        ctx.strokeStyle = '#111'; ctx.lineWidth = 1.5;
-        ctx.strokeRect(p.x+0.75, p.y+0.75, p.w-1.5, p.h-1.5);
-      } else {
-        // warm brown stone ground
-        ctx.fillStyle = '#6a5030'; ctx.fillRect(p.x, p.y, p.w, p.h);
-        // grass strip on top
-        ctx.fillStyle = '#4a8a20'; ctx.fillRect(p.x, p.y, p.w, 5);
-        ctx.fillStyle = '#5aaa28'; ctx.fillRect(p.x, p.y, p.w, 2);
-        // brick pattern
-        ctx.strokeStyle = '#4a3820'; ctx.lineWidth = 1;
-        for (let bx = p.x; bx < p.x + p.w; bx += 40) {
-          for (let by = p.y + 6; by < p.y + p.h - 2; by += 12) {
-            const offset = ((by - p.y) / 12 % 2 === 0) ? 0 : 20;
-            ctx.strokeRect(bx + offset + 1, by + 1, 38, 10);
+        g.fillRect(0, 430, W, 40);
+        for (let x = 330; x < 540; x += 12) {
+          const h = 50 + rnd() * 18;
+          g.beginPath(); g.moveTo(x, 440); g.lineTo(x, 440 - h); g.lineTo(x + 5, 440 - h - 8); g.lineTo(x + 10, 440 - h); g.lineTo(x + 10, 440); g.fill();
+        }
+        const haze = g.createLinearGradient(0, 360, 0, 460);
+        haze.addColorStop(0, 'rgba(255,150,90,0)'); haze.addColorStop(1, 'rgba(255,150,90,0.18)');
+        g.fillStyle = haze; g.fillRect(0, 360, W, 100);
+      } else if (v === 1) { // Goblin forest at night
+        sky.addColorStop(0, '#04100b'); sky.addColorStop(0.55, '#0d2618'); sky.addColorStop(1, '#1c3c26');
+        g.fillStyle = sky; g.fillRect(0, 0, W, H);
+        this._glow(g, 160, 95, 120, 'rgba(190,240,190,0.22)');
+        g.fillStyle = '#d6efcd'; g.beginPath(); g.arc(160, 95, 24, 0, Math.PI * 2); g.fill();
+        const pines = (baseY, minH, maxH, color, spacing) => {
+          g.fillStyle = color;
+          for (let x = -20; x < W + 20; x += spacing * (0.6 + rnd() * 0.8)) {
+            const h = minH + rnd() * (maxH - minH), w = h * 0.42;
+            for (let k = 0; k < 3; k++) { // three stacked tiers per pine
+              const ty = baseY - h + k * h * 0.28, tw = w * (0.55 + k * 0.25);
+              g.beginPath(); g.moveTo(x, ty); g.lineTo(x - tw / 2, ty + h * 0.45); g.lineTo(x + tw / 2, ty + h * 0.45); g.closePath(); g.fill();
+            }
+            g.fillRect(x - 2, baseY - 10, 4, 12);
           }
+          g.fillRect(0, baseY, W, H - baseY);
+        };
+        pines(330, 70, 120, '#173a26', 34);
+        const mist = g.createLinearGradient(0, 280, 0, 360);
+        mist.addColorStop(0, 'rgba(160,210,180,0)'); mist.addColorStop(1, 'rgba(160,210,180,0.16)');
+        g.fillStyle = mist; g.fillRect(0, 280, W, 80);
+        pines(390, 90, 150, '#0d2618', 46);
+        const mist2 = g.createLinearGradient(0, 360, 0, 460);
+        mist2.addColorStop(0, 'rgba(150,200,170,0)'); mist2.addColorStop(1, 'rgba(150,200,170,0.14)');
+        g.fillStyle = mist2; g.fillRect(0, 360, W, 100);
+        // foreground trunks at the edges, canopy and hanging vines
+        for (const [tx, tw] of [[-6, 38], [772, 40]]) {
+          g.fillStyle = '#06110a'; g.fillRect(tx, 0, tw, H);
+          g.fillStyle = '#122a1a'; g.fillRect(tx + (tx < 400 ? tw - 4 : 0), 0, 4, H);
         }
-        // thick outline
-        ctx.strokeStyle = '#111'; ctx.lineWidth = 2;
-        ctx.strokeRect(p.x+1, p.y+1, p.w-2, p.h-2);
+        g.fillStyle = '#040c07';
+        for (let x = 0; x < W; x += 26) { g.beginPath(); g.arc(x, -4, 18 + rnd() * 16, 0, Math.PI * 2); g.fill(); }
+        g.lineWidth = 2;
+        for (let i = 0; i < 9; i++) {
+          const x = 40 + rnd() * 720, len = 40 + rnd() * 110, sway = (rnd() - 0.5) * 24;
+          g.strokeStyle = '#1d4a2a'; g.beginPath(); g.moveTo(x, 0); g.quadraticCurveTo(x + sway, len / 2, x - sway / 2, len); g.stroke();
+          g.fillStyle = '#2a6a38';
+          for (let l = 14; l < len; l += 14) { g.beginPath(); g.ellipse(x + sway * (l / len) * 0.4 + 3, l, 4, 2, 0.6, 0, Math.PI * 2); g.fill(); }
+        }
+      } else {              // Orc fortress under a volcanic sky
+        sky.addColorStop(0, '#120405'); sky.addColorStop(0.5, '#3a0d08'); sky.addColorStop(1, '#7c2c10');
+        g.fillStyle = sky; g.fillRect(0, 0, W, H);
+        // volcano with glowing crater and lava streaks
+        g.fillStyle = '#2c0b09';
+        g.beginPath(); g.moveTo(380, 370); g.lineTo(590, 165); g.lineTo(640, 165); g.lineTo(840, 370); g.closePath(); g.fill();
+        this._glow(g, 615, 160, 110, 'rgba(255,110,30,0.55)');
+        g.strokeStyle = 'rgba(255,110,30,0.7)'; g.lineWidth = 2;
+        for (const [x1, x2] of [[600, 560], [620, 650], [630, 700]]) {
+          g.beginPath(); g.moveTo(x1, 168); g.quadraticCurveTo((x1 + x2) / 2 + 8, 230, x2, 290); g.stroke();
+        }
+        this._ridge(g, rnd, 370, 40, 80, '#260a08', false);
+        // fortress wall with towers
+        const stone = '#1c0d0d', wallTop = 345;
+        g.fillStyle = stone; g.fillRect(0, wallTop, W, H - wallTop);
+        for (let x = 0; x < W; x += 28) g.fillRect(x, wallTop - 12, 15, 12);
+        for (const tx of [55, 655]) {
+          g.fillRect(tx, 250, 90, H - 250);
+          for (let x = tx; x < tx + 90; x += 22) g.fillRect(x, 236, 13, 14);
+          g.fillStyle = '#ff8a30'; g.fillRect(tx + 40, 290, 6, 16); g.fillRect(tx + 40, 330, 6, 16); g.fillStyle = stone;
+          // banner with a notched tail
+          g.fillStyle = '#8a1a14';
+          g.beginPath(); g.moveTo(tx + 14, 262); g.lineTo(tx + 32, 262); g.lineTo(tx + 32, 318); g.lineTo(tx + 23, 308); g.lineTo(tx + 14, 318); g.closePath(); g.fill();
+          g.fillStyle = '#1a0a0a'; g.beginPath(); g.arc(tx + 23, 282, 5, 0, Math.PI * 2); g.fill();
+          g.fillStyle = stone;
+        }
+        g.strokeStyle = 'rgba(255,255,255,0.04)'; g.lineWidth = 1;
+        for (let y = wallTop + 12; y < H; y += 14) { g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke(); }
+        const haze = g.createLinearGradient(0, 300, 0, 470);
+        haze.addColorStop(0, 'rgba(255,80,20,0)'); haze.addColorStop(1, 'rgba(255,80,20,0.16)');
+        g.fillStyle = haze; g.fillRect(0, 300, W, 170);
+      }
+    });
+  }
+  _initParticles(v) {
+    const rnd = Math.random;
+    this._particles = [];
+    const n = v === 0 ? 18 : v === 1 ? 26 : 40;
+    for (let i = 0; i < n; i++) this._particles.push({ x: rnd() * 800, y: rnd() * 470, s: rnd(), p: rnd() * 6.28 });
+  }
+  _drawAmbient(v) {
+    const ctx = this.ctx, dt = this._dt, t = this._now / 1000;
+    ctx.save();
+    if (v === 0) {
+      // stars fade out toward the bright horizon
+      ctx.fillStyle = '#ffffff';
+      for (const s of this._stars) {
+        ctx.globalAlpha = Math.max(0, (0.6 + Math.sin(t + s.x) * 0.4) * (1 - s.y / 200));
+        ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+      }
+      // campfire between the tents
+      const fl = 0.8 + Math.sin(t * 13) * 0.1 + Math.sin(t * 7.3) * 0.1;
+      ctx.globalAlpha = 1; this._glow(ctx, 170, 438, 70 * fl, 'rgba(255,150,60,0.45)');
+      ctx.fillStyle = '#ffb040';
+      ctx.beginPath(); ctx.moveTo(162, 444); ctx.quadraticCurveTo(170, 420 - fl * 8, 178, 444); ctx.fill();
+      ctx.fillStyle = '#fff0a0';
+      ctx.beginPath(); ctx.moveTo(166, 444); ctx.quadraticCurveTo(170, 432 - fl * 4, 174, 444); ctx.fill();
+      // drifting dust
+      ctx.fillStyle = '#ffd8a0';
+      for (const p of this._particles) {
+        p.x += (8 + p.s * 10) * dt; if (p.x > 805) p.x = -5;
+        ctx.globalAlpha = 0.25 + 0.2 * Math.sin(t * 2 + p.p);
+        ctx.fillRect(p.x, p.y + Math.sin(t + p.p) * 6, 1.5, 1.5);
+      }
+    } else if (v === 1) {
+      // fireflies
+      for (const p of this._particles) {
+        p.x += Math.cos(t * 0.7 + p.p) * 12 * dt; p.y += Math.sin(t * 0.9 + p.p * 2) * 10 * dt;
+        const a = Math.max(0, Math.sin(t * (1 + p.s) + p.p));
+        ctx.globalAlpha = a * 0.5; this._glow(ctx, p.x, p.y, 7, 'rgba(200,255,120,0.8)');
+        ctx.globalAlpha = a; ctx.fillStyle = '#eaffb0'; ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
+      }
+    } else {
+      // braziers on the towers
+      for (const bx of [100, 700]) {
+        const fl = 0.8 + Math.sin(t * 11 + bx) * 0.12 + Math.sin(t * 6.1) * 0.08;
+        ctx.globalAlpha = 1; this._glow(ctx, bx, 226, 50 * fl, 'rgba(255,120,40,0.5)');
+        ctx.fillStyle = '#2a1410'; ctx.fillRect(bx - 9, 228, 18, 8);
+        ctx.fillStyle = '#ff8a2a'; ctx.beginPath(); ctx.moveTo(bx - 8, 229); ctx.quadraticCurveTo(bx, 206 - fl * 8, bx + 8, 229); ctx.fill();
+        ctx.fillStyle = '#ffe080'; ctx.beginPath(); ctx.moveTo(bx - 4, 229); ctx.quadraticCurveTo(bx, 216 - fl * 4, bx + 4, 229); ctx.fill();
+      }
+      // rising embers
+      ctx.fillStyle = '#ffa040';
+      for (const p of this._particles) {
+        p.y -= (18 + p.s * 30) * dt; p.x += Math.sin(t * 1.5 + p.p) * 10 * dt;
+        if (p.y < -5) { p.y = 470; p.x = Math.random() * 800; }
+        ctx.globalAlpha = 0.4 + 0.5 * Math.abs(Math.sin(t * 3 + p.p));
+        ctx.fillRect(p.x, p.y, 1.5 + p.s, 1.5 + p.s);
       }
     }
+    ctx.restore();
+  }
+  _drawBg(v) {
+    if (!this._bgCache || this._bgCache.v !== v) {
+      this._bgCache = { v, img: this._buildBackdrop(v) };
+      this._initParticles(v);
+    }
+    this.ctx.drawImage(this._bgCache.img, 0, 0, this.W, this.H);
+    this._drawAmbient(v);
+  }
+  // ── Platforms ───────────────────────────────────────────────────────────────
+  _paintGround(g, p, v, rnd) {
+    const pal = [
+      { top: '#7a5c3e', bot: '#4a3524', grass: '#5f9e34', lite: '#9ad25a' },
+      { top: '#56634a', bot: '#2e3a28', grass: '#3d8a3a', lite: '#6cc060' },
+      { top: '#4e3c38', bot: '#2a1e1c', grass: '#3a2a26', lite: '#6a5048' },
+    ][v];
+    const body = g.createLinearGradient(0, p.y, 0, p.y + p.h);
+    body.addColorStop(0, pal.top); body.addColorStop(1, pal.bot);
+    g.fillStyle = body; g.fillRect(p.x, p.y, p.w, p.h);
+    // stone blocks with per-block shading
+    g.save(); g.beginPath(); g.rect(p.x, p.y, p.w, p.h); g.clip();
+    let row = 0;
+    for (let by = p.y + 6; by < p.y + p.h; by += 12, row++) {
+      for (let bx = p.x - (row % 2) * 18; bx < p.x + p.w; ) {
+        const bw = 30 + Math.floor(rnd() * 14);
+        const shade = rnd() * 0.16 - 0.08;
+        g.fillStyle = shade > 0 ? `rgba(255,240,220,${shade})` : `rgba(0,0,0,${-shade})`;
+        g.fillRect(bx + 1, by + 1, bw - 2, 10);
+        g.fillStyle = 'rgba(255,255,255,0.10)'; g.fillRect(bx + 1, by + 1, bw - 2, 1);
+        g.fillStyle = 'rgba(0,0,0,0.35)'; g.fillRect(bx + 1, by + 10, bw - 2, 1); g.fillRect(bx + bw - 1, by + 1, 1, 10);
+        bx += bw;
+      }
+    }
+    g.restore();
+    this._paintTopEdge(g, p, pal, v, rnd, 6);
+    g.strokeStyle = 'rgba(0,0,0,0.55)'; g.lineWidth = 1.5; g.strokeRect(p.x + 0.75, p.y + 0.75, p.w - 1.5, p.h - 1.5);
+  }
+  // Grass lip (or scorched crust for the fortress) with tufts hanging over the edge.
+  _paintTopEdge(g, p, pal, v, rnd, band) {
+    g.fillStyle = pal.grass; g.fillRect(p.x, p.y, p.w, band);
+    g.fillStyle = pal.lite; g.fillRect(p.x, p.y, p.w, 2);
+    if (v === 2) {
+      g.strokeStyle = 'rgba(255,110,30,0.8)'; g.lineWidth = 1;
+      for (let x = p.x + 8; x < p.x + p.w - 8; x += 22 + rnd() * 30) {
+        g.beginPath(); g.moveTo(x, p.y + 2); g.lineTo(x + 4, p.y + band - 1); g.lineTo(x + 9, p.y + band + 1); g.stroke();
+      }
+      return;
+    }
+    g.fillStyle = pal.grass;
+    for (let x = p.x + 3; x < p.x + p.w - 3; x += 5 + rnd() * 7) {
+      g.beginPath(); g.arc(x, p.y + band, 1.5 + rnd() * 2.5, 0, Math.PI); g.fill(); // hanging tufts
+    }
+    g.fillStyle = pal.lite;
+    for (let x = p.x + 4; x < p.x + p.w - 4; x += 6 + rnd() * 10) {
+      const h = 2 + rnd() * 3; // blades poking up
+      g.beginPath(); g.moveTo(x, p.y + 1); g.lineTo(x + 1, p.y - h); g.lineTo(x + 2.5, p.y + 1); g.fill();
+    }
+  }
+  _paintPlank(g, p, v, rnd) {
+    // soft shadow under the plank
+    const sh = g.createLinearGradient(0, p.y + p.h, 0, p.y + p.h + 8);
+    sh.addColorStop(0, 'rgba(0,0,0,0.28)'); sh.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = sh; g.fillRect(p.x + 4, p.y + p.h, p.w - 8, 8);
+    // support brackets
+    g.fillStyle = '#2a1a10';
+    for (const bx of [p.x + 10, p.x + p.w - 18]) {
+      g.beginPath(); g.moveTo(bx, p.y + p.h); g.lineTo(bx + 8, p.y + p.h); g.lineTo(bx + 4, p.y + p.h + 7); g.closePath(); g.fill();
+    }
+    const wood = v === 2 ? ['#6a4430', '#3e2618'] : ['#9a6a3c', '#5e3a1e'];
+    const body = g.createLinearGradient(0, p.y, 0, p.y + p.h);
+    body.addColorStop(0, wood[0]); body.addColorStop(1, wood[1]);
+    g.fillStyle = body;
+    g.beginPath(); g.roundRect ? g.roundRect(p.x, p.y, p.w, p.h, 3) : g.rect(p.x, p.y, p.w, p.h); g.fill();
+    g.save(); g.clip();
+    // grain
+    g.strokeStyle = 'rgba(40,20,8,0.35)'; g.lineWidth = 1;
+    for (let gy = p.y + 5; gy < p.y + p.h - 2; gy += 4) {
+      g.beginPath(); g.moveTo(p.x, gy + rnd()); g.bezierCurveTo(p.x + p.w * 0.3, gy - 1, p.x + p.w * 0.6, gy + 1.5, p.x + p.w, gy); g.stroke();
+    }
+    // plank seams with nails
+    for (let sx = p.x + 24 + rnd() * 14; sx < p.x + p.w - 10; sx += 28 + rnd() * 16) {
+      g.fillStyle = 'rgba(0,0,0,0.45)'; g.fillRect(sx, p.y, 1.5, p.h);
+      g.fillStyle = 'rgba(255,220,170,0.15)'; g.fillRect(sx + 1.5, p.y, 1, p.h);
+      g.fillStyle = '#c8b090'; g.fillRect(sx - 3, p.y + 5, 1.5, 1.5); g.fillRect(sx + 4, p.y + 5, 1.5, 1.5);
+    }
+    if (v === 2) { // iron end bands
+      g.fillStyle = '#4a4648';
+      g.fillRect(p.x + 3, p.y, 6, p.h); g.fillRect(p.x + p.w - 9, p.y, 6, p.h);
+      g.fillStyle = '#8a8488'; g.fillRect(p.x + 5, p.y + 3, 2, 2); g.fillRect(p.x + p.w - 7, p.y + 3, 2, 2);
+    }
+    g.restore();
+    g.fillStyle = 'rgba(255,230,190,0.25)'; g.fillRect(p.x + 2, p.y + 1, p.w - 4, 1.5);
+    if (v === 1) { // moss patches and drips in the forest
+      for (let x = p.x + 6; x < p.x + p.w - 10; x += 18 + rnd() * 26) {
+        const w = Math.min(8 + rnd() * 16, p.x + p.w - 4 - x);
+        g.fillStyle = '#3d8a3a'; g.fillRect(x, p.y, w, 3);
+        g.beginPath(); g.ellipse(x + w / 2, p.y + 3, w / 2, 2.5, 0, 0, Math.PI); g.fill();
+        if (rnd() < 0.5) { g.fillStyle = '#2f6e30'; g.fillRect(x + w * 0.6, p.y + p.h, 1.5, 3 + rnd() * 6); }
+      }
+    }
+    g.strokeStyle = 'rgba(0,0,0,0.6)'; g.lineWidth = 1.2;
+    g.beginPath(); g.roundRect ? g.roundRect(p.x + 0.6, p.y + 0.6, p.w - 1.2, p.h - 1.2, 3) : g.rect(p.x + 0.6, p.y + 0.6, p.w - 1.2, p.h - 1.2); g.stroke();
+  }
+  _drawPlatforms(platforms) {
+    const v = this._bgCache ? this._bgCache.v : 0;
+    if (!this._platCache || this._platCache.list !== platforms || this._platCache.v !== v) {
+      const rnd = Renderer._rng(7 + v * 31 + platforms.length);
+      this._platCache = { list: platforms, v, img: this._offscreen(g => {
+        for (const p of platforms) {
+          if (p.oneWay) this._paintPlank(g, p, v, rnd); else this._paintGround(g, p, v, rnd);
+        }
+      }) };
+    }
+    this.ctx.drawImage(this._platCache.img, 0, 0, this.W, this.H);
+  }
+  _drawVignette() {
+    if (!this._vignette) this._vignette = this._offscreen(g => {
+      const gr = g.createRadialGradient(400, 260, 220, 400, 260, 520);
+      gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,0.45)');
+      g.fillStyle = gr; g.fillRect(0, 0, this.W, this.H);
+    });
+    this.ctx.drawImage(this._vignette, 0, 0, this.W, this.H);
   }
   _drawPlayer(player) {
     const { x, y, w, h, facing: f, charId } = player;
-    const alpha = player.isInvincible ? 0.5 + Math.sin(Date.now()/80)*0.5 : 1;
-    const flipX = (f === -1);
-    if (this._drawSprite(charId, x, y, w, h, flipX, alpha)) return;
+    const alpha = player.isInvincible ? 0.55 + Math.sin(Date.now()/70)*0.35 : 1;
+    // bright flash right after taking damage (invincibleTimer starts at 1500)
+    const flash = player.invincibleTimer > 1300 ? (player.invincibleTimer - 1300) / 200 : 0;
+    if (this._drawActor(player, charId, {
+      alpha, flash,
+      attack: player.state === 'attack' ? player.attackAnim : 0,
+      dash: player.state === 'special',
+    })) return;
     // Procedural fallback
     const ctx = this.ctx; ctx.save();
     ctx.globalAlpha = alpha;
@@ -1030,11 +1368,22 @@ class Renderer {
   }
   _drawEnemy(enemy) {
     const { x, y, w, h, facing:f, faction, variant, isBoss, enemyId } = enemy;
-    const alpha = enemy.hitFlashTimer > 0 ? 0.4 + Math.sin(Date.now()/40)*0.6 : 1;
-    const flipX = (f === -1);
     // Sprite-based drawing (uses enemyId which matches SPRITE_DATA keys)
     const spriteKey = enemyId || (isBoss ? FACTION_BOSS[faction] : null);
-    if (!spriteKey || !this._drawSprite(spriteKey, x, y, w, h, flipX, alpha)) {
+    // attack progress: first 250ms after the cooldown is re-armed
+    const sinceAtk = enemy.attackCooldown - enemy.attackCooldownTimer;
+    const attack = enemy.attackCooldownTimer > 0 && sinceAtk < 250 ? sinceAtk / 250 : 0;
+    const pulse = 0.6 + Math.sin(Date.now()/100)*0.4;
+    const drawn = spriteKey && this._drawActor(enemy, spriteKey, {
+      flash: enemy.hitFlashTimer / 200,
+      attack,
+      dash: !!enemy.charging,
+      scale: isBoss ? 0.97 : 1,
+      glow: enemy.phase2 ? `rgba(255,60,30,${0.6 + pulse*0.4})` : null,
+      glowBlur: 10 + pulse * 10,
+    });
+    if (!drawn) {
+      const alpha = enemy.hitFlashTimer > 0 ? 0.4 + Math.sin(Date.now()/40)*0.6 : 1;
       // Procedural fallback
       const ctx = this.ctx; ctx.save();
       ctx.globalAlpha = alpha;
@@ -1046,10 +1395,14 @@ class Renderer {
     }
     // HP bar (always drawn on top)
     const ctx = this.ctx;
-    const bw=enemy.w+8, bx=enemy.x-4, by=enemy.y-10, fr=Math.max(0,enemy.hp/enemy.maxHp);
-    ctx.fillStyle='#222'; ctx.fillRect(bx,by,bw,5);
-    ctx.fillStyle=fr>0.5?Colors.HP_HIGH:fr>0.25?Colors.HP_MED:Colors.HP_LOW; ctx.fillRect(bx,by,Math.round(bw*fr),5);
-    ctx.strokeStyle='#555'; ctx.lineWidth=1; ctx.strokeRect(bx,by,bw,5);
+    const top = drawn && enemy._visTop !== undefined ? Math.min(enemy.y, enemy._visTop) : enemy.y;
+    const bw=enemy.w+8, bx=enemy.x-4, by=top-8, fr=Math.max(0,enemy.hp/enemy.maxHp);
+    if (fr >= 1 && !isBoss) return;
+    const rr = (x0, w0) => { ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x0, by, w0, 5, 2.5) : ctx.rect(x0, by, w0, 5); };
+    ctx.fillStyle='rgba(10,6,14,0.75)'; rr(bx-1, bw+2); ctx.fill();
+    ctx.fillStyle=isBoss ? '#e04040' : fr>0.5?Colors.HP_HIGH:fr>0.25?Colors.HP_MED:Colors.HP_LOW;
+    if (fr > 0) { rr(bx, Math.max(3, bw*fr)); ctx.fill(); }
+    ctx.fillStyle='rgba(255,255,255,0.25)'; ctx.fillRect(bx+2, by+1, Math.max(0, bw*fr-4), 1);
   }
   _drawBandit(ctx,x,y,w,h,f,variant) {
     ctx.save();
@@ -1355,26 +1708,61 @@ class Renderer {
   }
   _drawProjectile(proj) {
     const ctx = this.ctx; ctx.save();
-    ctx.fillStyle = proj.owner==='player' ? Colors.PROJECTILE_ARROW : Colors.PROJECTILE_BOLT;
-    ctx.translate(proj.cx, proj.cy); ctx.rotate(Math.atan2(proj.vy, proj.vx));
-    ctx.fillRect(-proj.w/2, -proj.h/2, proj.w, proj.h);
-    if (proj.owner==='player') {
-      ctx.fillStyle='#eeee22'; ctx.beginPath(); ctx.moveTo(proj.w/2,0); ctx.lineTo(proj.w/2-4,-3); ctx.lineTo(proj.w/2-4,3); ctx.closePath(); ctx.fill();
+    const ang = Math.atan2(proj.vy, proj.vx);
+    if (proj.kind === 'goblinShaman') {
+      // spirit-fire orb with a fading trail
+      const sp = Math.hypot(proj.vx, proj.vy) || 1, ux = proj.vx / sp, uy = proj.vy / sp;
+      for (let i = 4; i >= 1; i--) {
+        ctx.globalAlpha = 0.12 * (5 - i);
+        ctx.fillStyle = '#7dffb0'; ctx.beginPath(); ctx.arc(proj.cx - ux * i * 6, proj.cy - uy * i * 6, 5 - i * 0.8, 0, Math.PI*2); ctx.fill();
+      }
+      ctx.globalAlpha = 1; this._glow(ctx, proj.cx, proj.cy, 14, 'rgba(100,255,170,0.6)');
+      ctx.fillStyle = '#e8fff0'; ctx.beginPath(); ctx.arc(proj.cx, proj.cy, 3, 0, Math.PI*2); ctx.fill();
+      ctx.restore(); return;
     }
+    ctx.translate(proj.cx, proj.cy); ctx.rotate(ang);
+    const player = proj.owner === 'player', len = player ? 18 : proj.kind === 'orcArcher' ? 20 : 16;
+    if (player && proj.piercing) { ctx.globalAlpha = 0.35; this._glow(ctx, 0, 0, 14, 'rgba(255,220,90,0.8)'); ctx.globalAlpha = 1; }
+    ctx.strokeStyle = player ? '#d8b878' : '#5a4030'; ctx.lineWidth = proj.kind === 'orcArcher' ? 2 : 1.5;
+    ctx.beginPath(); ctx.moveTo(-len/2, 0); ctx.lineTo(len/2 - 3, 0); ctx.stroke();
+    ctx.fillStyle = player ? '#e8e8f0' : '#9a9aa0';
+    ctx.beginPath(); ctx.moveTo(len/2 + 2, 0); ctx.lineTo(len/2 - 4, -3); ctx.lineTo(len/2 - 4, 3); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = player ? '#cc3322' : '#3a2a2a';
+    ctx.beginPath(); ctx.moveTo(-len/2 + 4, 0); ctx.lineTo(-len/2 - 1, -3.5); ctx.lineTo(-len/2 + 1, 0); ctx.lineTo(-len/2 - 1, 3.5); ctx.closePath(); ctx.fill();
     ctx.restore();
   }
   _drawEffect(ef) {
-    const ctx = this.ctx, prog = ef.timer / ef.maxTimer;
-    ctx.save(); ctx.globalAlpha = prog;
+    const ctx = this.ctx, prog = ef.timer / ef.maxTimer; // 1 -> 0
+    ctx.save(); ctx.globalAlpha = Math.min(1, prog * 1.3);
     if (ef.type==='hit') {
-      ctx.fillStyle=Colors.HIT_FLASH; ctx.beginPath(); ctx.arc(ef.x,ef.y,12*(1-prog)+4,0,Math.PI*2); ctx.fill();
+      if (ef._a === undefined) ef._a = Math.random() * Math.PI;
+      const t = 1 - prog;
+      ctx.strokeStyle = 'rgba(255,240,200,0.9)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(ef.x, ef.y, 4 + t * 14, 0, Math.PI*2); ctx.stroke();
+      ctx.strokeStyle = '#ffe070'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+      for (let i = 0; i < 6; i++) {
+        const a = ef._a + i * Math.PI / 3, r0 = 3 + t * 10, r1 = r0 + 7 * prog + 2;
+        ctx.beginPath(); ctx.moveTo(ef.x + Math.cos(a) * r0, ef.y + Math.sin(a) * r0); ctx.lineTo(ef.x + Math.cos(a) * r1, ef.y + Math.sin(a) * r1); ctx.stroke();
+      }
+      ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.arc(ef.x, ef.y, 4 * prog, 0, Math.PI*2); ctx.fill();
     } else if (ef.type==='aoe_ring') {
-      ctx.strokeStyle=Colors.AOE_RING; ctx.lineWidth=4*prog;
-      ctx.beginPath(); ctx.arc(ef.cx,ef.cy,ef.radius*(1-prog*0.3),0,Math.PI*2); ctx.stroke();
+      const t = 1 - prog, r = ef.radius * (0.3 + t * 0.8);
+      ctx.strokeStyle = 'rgba(255,190,80,0.85)'; ctx.lineWidth = 5 * prog + 1;
+      ctx.beginPath(); ctx.ellipse(ef.cx, ef.cy, r, r * 0.35, 0, 0, Math.PI*2); ctx.stroke();
+      ctx.fillStyle = 'rgba(140,110,80,0.5)';
+      for (let i = 0; i < 10; i++) {
+        const a = i / 10 * Math.PI * 2;
+        ctx.beginPath(); ctx.arc(ef.cx + Math.cos(a) * r * 0.9, ef.cy + Math.sin(a) * r * 0.3 - t * 8, 3 + t * 5, 0, Math.PI*2); ctx.fill();
+      }
     } else if (ef.type==='slash') {
-      ctx.strokeStyle=Colors.HIT_FLASH; ctx.lineWidth=3;
-      const sx=ef.facing===1?ef.x:ef.x+ef.w;
-      ctx.beginPath(); ctx.moveTo(sx,ef.y); ctx.lineTo(sx+ef.facing*ef.w*prog,ef.y+ef.h); ctx.stroke();
+      // crescent swoosh in front of the attacker
+      const f = ef.facing, sx = f===1 ? ef.x : ef.x+ef.w, t = 1 - prog;
+      const reach = ef.w * (0.6 + t * 0.6), y0 = ef.y - 4, y1 = ef.y + ef.h;
+      ctx.fillStyle = ef.enemy ? 'rgba(255,120,100,0.75)' : 'rgba(255,255,255,0.85)';
+      ctx.beginPath(); ctx.moveTo(sx, y0);
+      ctx.quadraticCurveTo(sx + f * reach * 1.6, (y0 + y1) / 2, sx, y1);
+      ctx.quadraticCurveTo(sx + f * reach * 0.9, (y0 + y1) / 2, sx, y0);
+      ctx.fill();
     }
     ctx.restore();
   }
@@ -1422,11 +1810,21 @@ class Renderer {
       ctx.fillStyle=sel?'rgba(255,200,50,0.2)':'rgba(0,0,0,0.5)'; ctx.fillRect(cx,cy,cardW,cardH);
       ctx.strokeStyle=sel?Colors.COOLDOWN_READY:'rgba(255,255,255,0.3)'; ctx.lineWidth=sel?3:1; ctx.strokeRect(cx,cy,cardW,cardH);
       const sprImg = this._sprites[def.id];
-      if (sprImg && sprImg.complete && sprImg.naturalHeight > 0) {
-        const dispH = 110;
-        const dispW = Math.round(sprImg.naturalWidth / sprImg.naturalHeight * dispH);
+      if (sprImg) {
+        const dispH = 118;
+        const dispW = Math.round(sprImg.width / sprImg.height * dispH);
+        const bob = sel ? Math.sin(Date.now()/300) * 3 : 0;
+        ctx.save();
+        // spotlight + floor shadow behind the portrait
+        const spot = ctx.createRadialGradient(cx+cardW/2, cy+90, 4, cx+cardW/2, cy+90, 90);
+        spot.addColorStop(0, sel ? 'rgba(255,210,120,0.35)' : 'rgba(255,255,255,0.08)'); spot.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = spot; ctx.fillRect(cx, cy, cardW, 150);
+        ctx.fillStyle = 'rgba(0,0,0,0.4)';
+        ctx.beginPath(); ctx.ellipse(cx+cardW/2, cy+136, dispW*0.42, 5, 0, 0, Math.PI*2); ctx.fill();
+        if (!sel) ctx.globalAlpha = 0.75;
         ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
-        ctx.drawImage(sprImg, cx + cardW/2 - dispW/2, cy + 18, dispW, dispH);
+        ctx.drawImage(sprImg, cx + cardW/2 - dispW/2, cy + 136 - dispH + bob, dispW, dispH);
+        ctx.restore();
       } else {
         ctx.save(); ctx.translate(cx+cardW/2,cy+80); ctx.scale(2,2);
         const pw=def.width, ph=def.height, px=-pw/2, py=-ph/2;
@@ -1563,8 +1961,7 @@ class Game {
       if (!document.fullscreenElement && this.selectedResolution === 2) {
         // User pressed Escape to exit fullscreen — revert to standard
         this.selectedResolution = 0;
-        this.canvas.style.width = '800px';
-        this.canvas.style.height = '500px';
+        this.renderer.setDisplaySize(800, 500);
       }
     });
   }
@@ -1572,10 +1969,10 @@ class Game {
     const canvas = this.canvas;
     const container = canvas.parentElement;
     if (idx === 0) {
-      canvas.style.width = '800px'; canvas.style.height = '500px';
+      this.renderer.setDisplaySize(800, 500);
       if (document.fullscreenElement) document.exitFullscreen();
     } else if (idx === 1) {
-      canvas.style.width = '1280px'; canvas.style.height = '800px';
+      this.renderer.setDisplaySize(1280, 800);
       if (document.fullscreenElement) document.exitFullscreen();
     } else {
       const req = container.requestFullscreen || container.webkitRequestFullscreen;
@@ -1588,8 +1985,7 @@ class Game {
   }
   _scaleToWindow() {
     const scale = Math.min(window.innerWidth / 800, window.innerHeight / 500);
-    this.canvas.style.width  = Math.floor(800 * scale) + 'px';
-    this.canvas.style.height = Math.floor(500 * scale) + 'px';
+    this.renderer.setDisplaySize(Math.floor(800 * scale), Math.floor(500 * scale));
   }
   _update(dt) {
     if      (this.state==='CHARACTER_SELECT') this._updateCharSelect();

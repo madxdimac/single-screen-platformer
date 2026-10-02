@@ -21,5 +21,4 @@ body {
 
 #gameCanvas {
   display: block;
-  image-rendering: pixelated;
 }

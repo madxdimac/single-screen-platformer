@@ -13,21 +13,8 @@ If a local server is preferred: `python -m http.server 8080` then visit `http://
 Character and enemy sprites are pre-processed PNG images embedded as base64 data URLs.
 
 1. **Source images**: `character_references/*.png` (12 files)
-2. **Processing**: `python tools/process_sprites.py` — BFS background removal, auto-crop, resize to 96px tall, base64-encode → writes `js/sprites_data.js`
-3. **Embedding**: After changing sprites or bundle.js, rebuild `index.html` by running:
-   ```python
-   # Concatenate sprites_data.js + bundle.js into index.html's <script> block
-   python - <<'EOF'
-   project = r'C:\Users\madxd\Documents\mad_dev\claude_projects\single_screen_platformer'
-   with open(project+r'\index.html','r',encoding='utf-8') as f: lines=f.readlines()
-   si=next(i for i,l in enumerate(lines) if l.strip()=='<script>')
-   ei=next(i for i,l in enumerate(lines) if l.strip()=='</script>' and i>si)
-   sprites=open(project+r'\js\sprites_data.js','r',encoding='utf-8').read()
-   bundle=open(project+r'\js\bundle.js','r',encoding='utf-8').read()
-   html=''.join(lines[:si+1])+'\n'+sprites+'\n'+bundle+'\n'+''.join(lines[ei:])
-   open(project+r'\index.html','w',encoding='utf-8',newline='\n').write(html)
-   EOF
-   ```
+2. **Processing**: `python3 tools/process_sprites.py` — detects the paper colour from the image border, flood-fills it from the border and from large enclosed gaps (e.g. between legs), soft-mattes edges against the paper colour (no white halo), drops small detached blobs (signatures), auto-crops, resizes to 128px tall → writes `js/sprites_data.js` (`SPRITE_DATA` data URLs + `SPRITE_META` sizes). Pure Pillow, no numpy.
+3. **Embedding**: after changing sprites or `bundle.js`, rebuild `index.html` with `python3 tools/build_html.py` (replaces the `<script>` block with `sprites_data.js` + `bundle.js`). The `<style>` block in `index.html` is not regenerated — keep it in sync with `css/style.css` by hand.
 
 Sprite keys in `SPRITE_DATA` match entity `enemyId` / player `charId` fields exactly: `champion`, `ranger`, `savage`, `banditThug`, `banditArcher`, `banditBoss`, `goblinWarrior`, `goblinShaman`, `goblinBoss`, `orcBrute`, `orcArcher`, `orcBoss`.
 
@@ -59,7 +46,9 @@ All game logic is inlined inside the `<script>` tag in **`index.html`**, which a
 
 ### Key design patterns
 
-- **Renderer** tries sprite rendering first (`_drawSprite(key, x, y, w, h, flipX, alpha)`), falls back to procedural shape drawing. Sprites are loaded async in `_initSprites()` from the global `SPRITE_DATA`.
+- **Renderer** tries sprite rendering first via `_drawActor(entity, key, opts)`, falling back to procedural shape drawing. Sprites are loaded async in `_initSprites()` and cached as outlined canvases (`_sprites`) plus white silhouettes for hit flashes (`_flash`). Sprites are drawn at their natural aspect, `Renderer.VISUAL_SCALE` × hitbox height, feet anchored to the hitbox bottom — visuals are deliberately decoupled from physics hitboxes. Animation (idle breathing, run bob/lean, jump stretch, landing squash, attack lunge, dash lean) is procedural transforms driven by entity state; per-entity anim state lives in a `WeakMap`.
+- **Resolution**: `Renderer.setDisplaySize(cssW, cssH)` sizes the canvas backing store to display size × devicePixelRatio and sets a transform so all drawing stays in 800×500 logical coordinates. Never assign `canvas.width/height` or `canvas.style` size elsewhere.
+- **World art**: per-faction backdrops (`_buildBackdrop`), platforms (`_paintGround` / `_paintPlank`) and the vignette are painted once into offscreen canvases (seeded RNG, so they're stable) and invalidated on resize; only lights and particles (`_drawAmbient`) animate per frame.
 - **AttackSystem** owns all hitbox resolution. Entities signal intent via `_pendingAttack` / `_pendingSpecial` / `_pendingAOE` flags that AttackSystem consumes each frame. Hitboxes use a `hitEntities` Set to prevent double-hits.
 - **PhysicsEngine** handles gravity + AABB. One-way platforms resolve only downward passes (`prevBottom <= platform.top + 2`). `entity.ignorePlatform` flag (300ms) enables drop-through.
 - **AISystem** drives enemies each frame; enemies expose `_pendingAttack` for AttackSystem to resolve.
